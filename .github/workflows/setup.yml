@@ -1,0 +1,67 @@
+name: Setup VM with Chrome and Input Director
+
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  setup:
+    runs-on: windows-latest
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Google Chrome
+        shell: powershell
+        run: |
+          choco install googlechrome -y --no-progress
+          Write-Host "Chrome installed successfully."
+
+      - name: Verify Chrome installation
+        shell: powershell
+        run: |
+          $chromePath = "C:\Program Files\Google\Chrome\Application\chrome.exe"
+          if (Test-Path $chromePath) {
+            $version = (Get-Item $chromePath).VersionInfo.ProductVersion
+            Write-Host "Google Chrome version: $version"
+          } else {
+            Write-Error "Chrome executable not found at expected path."
+            exit 1
+          }
+
+      - name: Download and install Input Director
+        shell: powershell
+        run: |
+          $installerUrl = "https://www.inputdirector.com/downloads/InputDirector-v1.4.2Setup.exe"
+          $installerPath = "$env:TEMP\InputDirectorSetup.exe"
+          Write-Host "Downloading Input Director..."
+          try {
+            Invoke-WebRequest -Uri $installerUrl -OutFile $installerPath -UseBasicParsing -ErrorAction Stop
+          } catch {
+            Write-Error "Failed to download Input Director: $_"
+            exit 1
+          }
+          if (-not (Test-Path $installerPath)) {
+            Write-Error "Installer file not found after download."
+            exit 1
+          }
+          Write-Host "Installing Input Director silently..."
+          $process = Start-Process -FilePath $installerPath -ArgumentList "/S" -Wait -NoNewWindow -PassThru
+          if ($process.ExitCode -ne 0) {
+            Write-Error "Input Director installer exited with code $($process.ExitCode)."
+            exit 1
+          }
+          Write-Host "Input Director installed successfully."
+
+      - name: Verify Input Director installation
+        shell: powershell
+        run: |
+          $inputDirPath = "C:\Program Files (x86)\Input Director\InputDirector.exe"
+          if (Test-Path $inputDirPath) {
+            Write-Host "Input Director found at: $inputDirPath"
+          } else {
+            Write-Warning "Input Director executable not found at expected path. Installation may have used a different directory."
+          }
