@@ -1,0 +1,223 @@
+name: Setup VM with Chrome and Input Director
+
+on:
+  push:
+  workflow_dispatch:
+    inputs:
+      session_minutes:
+        description: "How long to keep the browser session alive (in minutes, max 120)"
+        required: false
+        default: "60"
+
+jobs:
+  setup:
+    runs-on: windows-latest
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Google Chrome
+        shell: powershell
+        run: |
+          choco install googlechrome -y --no-progress
+          Write-Host "Chrome installed successfully."
+
+      - name: Verify Chrome installation
+        shell: powershell
+        run: |
+          $chromePath = "C:\Program Files\Google\Chrome\Application\chrome.exe"
+          if (Test-Path $chromePath) {
+            $version = (Get-Item $chromePath).VersionInfo.ProductVersion
+            Write-Host "Google Chrome version: $version"
+          } else {
+            Write-Error "Chrome executable not found at expected path."
+            exit 1
+          }
+
+      - name: Download and install Input Director
+        shell: powershell
+        run: |
+          $installerUrl = "https://www.inputdirector.com/downloads/InputDirector-v1.4.2Setup.exe"
+          $installerPath = "$env:TEMP\InputDirectorSetup.exe"
+          Write-Host "Downloading Input Director..."
+          try {
+            Invoke-WebRequest -Uri $installerUrl -OutFile $installerPath -UseBasicParsing -ErrorAction Stop
+          } catch {
+            Write-Error "Failed to download Input Director: $_"
+            exit 1
+          }
+          if (-not (Test-Path $installerPath)) {
+            Write-Error "Installer file not found after download."
+            exit 1
+          }
+          Write-Host "Installing Input Director silently..."
+          $process = Start-Process -FilePath $installerPath -ArgumentList "/S" -Wait -NoNewWindow -PassThru
+          if ($process.ExitCode -ne 0) {
+            Write-Error "Input Director installer exited with code $($process.ExitCode)."
+            exit 1
+          }
+          Write-Host "Input Director installed successfully."
+
+      - name: Verify Input Director installation
+        shell: powershell
+        run: |
+          $inputDirPath = "C:\Program Files (x86)\Input Director\InputDirector.exe"
+          if (Test-Path $inputDirPath) {
+            Write-Host "Input Director found at: $inputDirPath"
+          } else {
+            Write-Warning "Input Director executable not found at expected path. Installation may have used a different directory."
+          }
+
+      # -- Browser-based desktop access (noVNC + Cloudflare quick tunnel) ----
+      # Open the Windows desktop in any web browser - no extra software needed
+      # on your local machine, no credit card, no account required.
+      #
+      # Required GitHub repository secret (Settings > Secrets > Actions):
+      #   VNC_PASSWORD  - the password you will type when the browser prompts you
+      #
+      # How to connect each time the workflow runs:
+      #   1. Wait for the "Set up noVNC" step to finish.
+      #   2. In the workflow log look for the line:
+      #        Open in your browser: https://xxxx.trycloudflare.com/vnc.html
+      #   3. Click (or copy-paste) that URL into any browser.
+      #   4. Enter your VNC_PASSWORD when prompted.
+      # ---------------------------------------------------------------------
+
+      - name: Install TightVNC server
+        shell: powershell
+        run: |
+          # Install TightVNC (server component only)
+          choco install tightvnc -y --no-progress --params "/ADDLOCAL=Server"
+
+          # Locate the TightVNC service - give the installer a few seconds
+          Start-Sleep -Seconds 5
+          $svc = Get-Service -Name "tvnserver" -ErrorAction SilentlyContinue
+          if (-not $svc) {
+            Write-Error "TightVNC service (tvnserver) not found after installation."
+            exit 1
+          }
+          if ($svc.Status -ne "Running") { Start-Service -Name "tvnserver" }
+
+          # Set VNC password via registry using VNC's DES encoding.
+          # VNC encodes the password by: bit-reversing each byte of the
+          # (up-to-8-char, zero-padded) password, then using it as a DES key
+          # to encrypt 8 zero bytes.  The resulting 8 bytes are stored in
+          # HKLM\...\TightVNC\Server as "Password".
+          # NOTE: VNC passwords are limited to 8 characters by the DES scheme;
+          # only the first 8 characters of VNC_PASSWORD are used.
+          if ($env:VNC_PASSWORD.Length -gt 8) {
+            Write-Warning "VNC_PASSWORD is longer than 8 characters; only the first 8 will be used."
+          }
+          $raw = $env:VNC_PASSWORD.Substring(0, [Math]::Min(8, $env:VNC_PASSWORD.Length)).PadRight(8, [char]0)
+          $passBytes = [System.Text.Encoding]::ASCII.GetBytes($raw)
+          for ($i = 0; $i -lt 8; $i++) {
+            $b = [byte]$passBytes[$i]
+            $passBytes[$i] = [byte](
+              (($b -band 0x01) -shl 7) -bor (($b -band 0x02) -shl 5) -bor
+              (($b -band 0x04) -shl 3) -bor (($b -band 0x08) -shl 1) -bor
+              (($b -band 0x10) -shr 1) -bor (($b -band 0x20) -shr 3) -bor
+              (($b -band 0x40) -shr 5) -bor (($b -band 0x80) -shr 7)
+            )
+          }
+          $des = [System.Security.Cryptography.DES]::Create()
+          $des.Key     = $passBytes
+          $des.IV      = New-Object byte[] 8
+          $des.Mode    = [System.Security.Cryptography.CipherMode]::ECB
+          $des.Padding = [System.Security.Cryptography.PaddingMode]::None
+          $hash = $des.CreateEncryptor().TransformFinalBlock((New-Object byte[] 8), 0, 8)
+
+          # Try both 64-bit and 32-bit (WOW6432Node) registry paths
+          foreach ($regPath in @("HKLM:\SOFTWARE\TightVNC\Server",
+                                  "HKLM:\SOFTWARE\WOW6432Node\TightVNC\Server")) {
+            if (Test-Path $regPath) {
+              Set-ItemProperty -Path $regPath -Name "Password"             -Value $hash -Type Binary
+              Set-ItemProperty -Path $regPath -Name "ControlPassword"      -Value $hash -Type Binary
+              Set-ItemProperty -Path $regPath -Name "UseVncAuthentication" -Value 1     -Type DWord
+              Write-Host "VNC password written to $regPath"
+            }
+          }
+
+          # Restart service so the new password takes effect
+          Restart-Service -Name "tvnserver" -Force
+          Write-Host "TightVNC server running on port 5900."
+        env:
+          VNC_PASSWORD: ${{ secrets.VNC_PASSWORD }}
+
+      - name: Set up noVNC and expose via Cloudflare Tunnel
+        shell: powershell
+        run: |
+          # -- websockify: WebSocket <-> TCP proxy (bridges noVNC to TightVNC) --
+          pip install websockify --quiet
+
+          # -- noVNC: browser-based VNC client (pinned version) --
+          $novncVersion = "1.5.0"
+          $novncZip = "$env:TEMP\novnc.zip"
+          Invoke-WebRequest `
+            -Uri "https://github.com/novnc/noVNC/archive/refs/tags/v$novncVersion.zip" `
+            -OutFile $novncZip -UseBasicParsing
+          Expand-Archive -Path $novncZip -DestinationPath $env:TEMP -Force
+          $novncDir = "$env:TEMP\noVNC-$novncVersion"
+
+          # Start websockify: listen on 6080, proxy to VNC on 5900
+          Start-Job -Name "websockify" -ScriptBlock {
+            param($dir)
+            websockify --web $dir 6080 localhost:5900
+          } -ArgumentList $novncDir | Out-Null
+          Start-Sleep -Seconds 3
+
+          # -- cloudflared quick tunnel (no account / no credit card needed) --
+          # Pinned release for reproducibility.
+          $cfVersion = "2024.11.1"
+          $cfExe = "$env:TEMP\cloudflared.exe"
+          $cfLog = "$env:TEMP\cloudflared.log"
+          Invoke-WebRequest `
+            -Uri "https://github.com/cloudflare/cloudflared/releases/download/$cfVersion/cloudflared-windows-amd64.exe" `
+            -OutFile $cfExe -UseBasicParsing
+
+          Start-Job -Name "cloudflared" -ScriptBlock {
+            param($exe, $log)
+            & $exe tunnel --url http://localhost:6080 --loglevel info 2>&1 |
+              ForEach-Object { $_ | Out-File -FilePath $log -Append -Encoding utf8 }
+          } -ArgumentList $cfExe, $cfLog | Out-Null
+
+          # Poll the log until Cloudflare prints the public HTTPS URL (up to 60 s)
+          $browserUrl = $null
+          for ($i = 0; $i -lt 30; $i++) {
+            Start-Sleep -Seconds 2
+            if (Test-Path $cfLog) {
+              $content = Get-Content $cfLog -Raw -ErrorAction SilentlyContinue
+              if ($content -match '(https://[a-z0-9-]+\.trycloudflare\.com)') {
+                $browserUrl = $Matches[1]
+                break
+              }
+            }
+          }
+
+          if ($browserUrl) {
+            Write-Host ""
+            Write-Host "=========================================="
+            Write-Host "  Open in your browser:"
+            Write-Host "  $browserUrl/vnc.html"
+            Write-Host ""
+            Write-Host "  Password: (value of VNC_PASSWORD secret)"
+            Write-Host "=========================================="
+          } else {
+            Write-Error "Cloudflare tunnel URL not found within 60 seconds."
+            if (Test-Path $cfLog) { Get-Content $cfLog }
+            exit 1
+          }
+
+      - name: Keep runner alive for browser session
+        shell: powershell
+        run: |
+          $minutes = [int]"$env:SESSION_MINUTES"
+          if ($minutes -le 0 -or $minutes -gt 120) { $minutes = 60 }
+          $seconds = $minutes * 60
+          Write-Host "Runner will stay alive for $minutes minute(s)."
+          Write-Host "Cancel this workflow run when you are done with your session."
+          Start-Sleep -Seconds $seconds
+        env:
+          SESSION_MINUTES: ${{ github.event.inputs.session_minutes || '60' }}
