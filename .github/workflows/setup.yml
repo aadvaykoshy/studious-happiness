@@ -4,8 +4,8 @@ on:
   push:
   workflow_dispatch:
     inputs:
-      rdp_session_minutes:
-        description: "How long to keep the RDP session alive (in minutes, max 120)"
+      session_minutes:
+        description: "How long to keep the browser session alive (in minutes, max 120)"
         required: false
         default: "60"
 
@@ -71,113 +71,153 @@ jobs:
             Write-Warning "Input Director executable not found at expected path. Installation may have used a different directory."
           }
 
-      # -- RDP access via Tailscale (free, no credit card required) ---------
-      # Tailscale creates a private mesh network between this runner and your
-      # local machine so you can connect with standard Remote Desktop.
+      # -- Browser-based desktop access (noVNC + Cloudflare quick tunnel) ----
+      # Open the Windows desktop in any web browser - no extra software needed
+      # on your local machine, no credit card, no account required.
       #
-      # One-time setup:
-      #   1. Sign up at https://tailscale.com (free, no credit card needed).
-      #   2. Install Tailscale on your local machine and sign in.
-      #   3. Generate an auth key at https://login.tailscale.com/admin/settings/keys
-      #      (click "Generate auth key"; a reusable key is convenient).
-      #   4. Add two GitHub repository secrets:
-      #        RDP_PASSWORD      - the RDP password you want to use
-      #        TAILSCALE_AUTHKEY - the auth key generated in step 3
+      # Required GitHub repository secret (Settings > Secrets > Actions):
+      #   VNC_PASSWORD  - the password you will type when the browser prompts you
       #
       # How to connect each time the workflow runs:
-      #   1. In the workflow log, look for the "Tailscale IP" line.
-      #      It will look like:  100.x.x.x
-      #   2. Open Remote Desktop Connection (mstsc) on your local machine.
-      #   3. In the "Computer" field enter:  100.x.x.x   (standard port 3389)
-      #   4. Username: runneradmin   Password: <value of RDP_PASSWORD secret>
+      #   1. Wait for the "Set up noVNC" step to finish.
+      #   2. In the workflow log look for the line:
+      #        Open in your browser: https://xxxx.trycloudflare.com/vnc.html
+      #   3. Click (or copy-paste) that URL into any browser.
+      #   4. Enter your VNC_PASSWORD when prompted.
       # ---------------------------------------------------------------------
 
-      - name: Enable Remote Desktop (RDP)
+      - name: Install TightVNC server
         shell: powershell
         run: |
-          # Enable RDP in the registry
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
-            -Name fDenyTSConnections -Value 0
+          # Install TightVNC (server component only)
+          choco install tightvnc -y --no-progress --params "/ADDLOCAL=Server"
 
-          # Allow RDP through Windows Firewall
-          Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
-
-          # Set the RDP password for the built-in runner account
-          $password = ConvertTo-SecureString "$env:RDP_PASSWORD" -AsPlainText -Force
-          Set-LocalUser -Name "runneradmin" -Password $password
-
-          Write-Host "RDP enabled. Connect as user: runneradmin"
-        env:
-          RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
-
-      - name: Install Tailscale and join network
-        shell: powershell
-        run: |
-          # Pinned Tailscale version for reproducibility
-          $tsVersion  = "1.78.1"
-          $tsInstaller = "$env:TEMP\tailscale-setup-$tsVersion.exe"
-          $tsUrl       = "https://pkgs.tailscale.com/stable/tailscale-setup-$tsVersion.exe"
-
-          Write-Host "Downloading Tailscale $tsVersion..."
-          Invoke-WebRequest -Uri $tsUrl -OutFile $tsInstaller -UseBasicParsing
-
-          # Install silently
-          Write-Host "Installing Tailscale..."
-          $proc = Start-Process -FilePath $tsInstaller -ArgumentList "/install", "/quiet", "/norestart" `
-            -Wait -NoNewWindow -PassThru
-          if ($proc.ExitCode -ne 0) {
-            Write-Error "Tailscale installer exited with code $($proc.ExitCode)."
+          # Locate the TightVNC service - give the installer a few seconds
+          Start-Sleep -Seconds 5
+          $svc = Get-Service -Name "tvnserver" -ErrorAction SilentlyContinue
+          if (-not $svc) {
+            Write-Error "TightVNC service (tvnserver) not found after installation."
             exit 1
           }
+          if ($svc.Status -ne "Running") { Start-Service -Name "tvnserver" }
 
-          # Give the Tailscale service a moment to start
-          Start-Sleep -Seconds 5
+          # Set VNC password via registry using VNC's DES encoding.
+          # VNC encodes the password by: bit-reversing each byte of the
+          # (up-to-8-char, zero-padded) password, then using it as a DES key
+          # to encrypt 8 zero bytes.  The resulting 8 bytes are stored in
+          # HKLM\...\TightVNC\Server as "Password".
+          # NOTE: VNC passwords are limited to 8 characters by the DES scheme;
+          # only the first 8 characters of VNC_PASSWORD are used.
+          if ($env:VNC_PASSWORD.Length -gt 8) {
+            Write-Warning "VNC_PASSWORD is longer than 8 characters; only the first 8 will be used."
+          }
+          $raw = $env:VNC_PASSWORD.Substring(0, [Math]::Min(8, $env:VNC_PASSWORD.Length)).PadRight(8, [char]0)
+          $passBytes = [System.Text.Encoding]::ASCII.GetBytes($raw)
+          for ($i = 0; $i -lt 8; $i++) {
+            $b = [byte]$passBytes[$i]
+            $passBytes[$i] = [byte](
+              (($b -band 0x01) -shl 7) -bor (($b -band 0x02) -shl 5) -bor
+              (($b -band 0x04) -shl 3) -bor (($b -band 0x08) -shl 1) -bor
+              (($b -band 0x10) -shr 1) -bor (($b -band 0x20) -shr 3) -bor
+              (($b -band 0x40) -shr 5) -bor (($b -band 0x80) -shr 7)
+            )
+          }
+          $des = [System.Security.Cryptography.DES]::Create()
+          $des.Key     = $passBytes
+          $des.IV      = New-Object byte[] 8
+          $des.Mode    = [System.Security.Cryptography.CipherMode]::ECB
+          $des.Padding = [System.Security.Cryptography.PaddingMode]::None
+          $hash = $des.CreateEncryptor().TransformFinalBlock((New-Object byte[] 8), 0, 8)
 
-          # Use the GitHub run ID in the hostname to avoid conflicts when
-          # multiple runners join the same network simultaneously.
-          $hostname = "gh-runner-$env:GITHUB_RUN_ID"
-
-          # Log in with the auth key -- runner joins your Tailscale network
-          $tailscale = "C:\Program Files\Tailscale\tailscale.exe"
-          & $tailscale up --authkey="$env:TAILSCALE_AUTHKEY" --hostname="$hostname"
-
-          # Wait for the interface to get an IP (up to 30 seconds)
-          $tsIP = $null
-          for ($i = 0; $i -lt 15; $i++) {
-            Start-Sleep -Seconds 2
-            $status = & $tailscale status --json 2>$null | ConvertFrom-Json
-            if ($status -and $status.Self -and $status.Self.TailscaleIPs -and $status.Self.TailscaleIPs.Count -gt 0) {
-              # Prefer the IPv4 address (100.x.x.x range)
-              $tsIP = $status.Self.TailscaleIPs | Where-Object { $_ -notmatch ':' } | Select-Object -First 1
-              if ($tsIP) { break }
+          # Try both 64-bit and 32-bit (WOW6432Node) registry paths
+          foreach ($regPath in @("HKLM:\SOFTWARE\TightVNC\Server",
+                                  "HKLM:\SOFTWARE\WOW6432Node\TightVNC\Server")) {
+            if (Test-Path $regPath) {
+              Set-ItemProperty -Path $regPath -Name "Password"             -Value $hash -Type Binary
+              Set-ItemProperty -Path $regPath -Name "ControlPassword"      -Value $hash -Type Binary
+              Set-ItemProperty -Path $regPath -Name "UseVncAuthentication" -Value 1     -Type DWord
+              Write-Host "VNC password written to $regPath"
             }
           }
 
-          if ($tsIP) {
-            Write-Host ""
-            Write-Host "=========================================="
-            Write-Host "  Tailscale IP: $tsIP"
-            Write-Host "  Username:     runneradmin"
-            Write-Host "  Open Remote Desktop Connection (mstsc)"
-            Write-Host "  and enter the IP above as the Computer."
-            Write-Host "=========================================="
-          } else {
-            Write-Error "Tailscale did not obtain an IP address within 30 seconds."
-            exit 1
-          }
+          # Restart service so the new password takes effect
+          Restart-Service -Name "tvnserver" -Force
+          Write-Host "TightVNC server running on port 5900."
         env:
-          TAILSCALE_AUTHKEY: ${{ secrets.TAILSCALE_AUTHKEY }}
+          VNC_PASSWORD: ${{ secrets.VNC_PASSWORD }}
 
-      - name: Keep runner alive for RDP session
+      - name: Set up noVNC and expose via Cloudflare Tunnel
         shell: powershell
         run: |
-          # Session duration comes from the workflow_dispatch input (default 60 min).
-          # Falls back to 60 minutes when the workflow is triggered by a push event.
+          # -- websockify: WebSocket <-> TCP proxy (bridges noVNC to TightVNC) --
+          pip install websockify --quiet
+
+          # -- noVNC: browser-based VNC client (pinned version) --
+          $novncVersion = "1.5.0"
+          $novncZip = "$env:TEMP\novnc.zip"
+          Invoke-WebRequest `
+            -Uri "https://github.com/novnc/noVNC/archive/refs/tags/v$novncVersion.zip" `
+            -OutFile $novncZip -UseBasicParsing
+          Expand-Archive -Path $novncZip -DestinationPath $env:TEMP -Force
+          $novncDir = "$env:TEMP\noVNC-$novncVersion"
+
+          # Start websockify: listen on 6080, proxy to VNC on 5900
+          Start-Job -Name "websockify" -ScriptBlock {
+            param($dir)
+            websockify --web $dir 6080 localhost:5900
+          } -ArgumentList $novncDir | Out-Null
+          Start-Sleep -Seconds 3
+
+          # -- cloudflared quick tunnel (no account / no credit card needed) --
+          # Pinned release for reproducibility.
+          $cfVersion = "2024.11.1"
+          $cfExe = "$env:TEMP\cloudflared.exe"
+          $cfLog = "$env:TEMP\cloudflared.log"
+          Invoke-WebRequest `
+            -Uri "https://github.com/cloudflare/cloudflared/releases/download/$cfVersion/cloudflared-windows-amd64.exe" `
+            -OutFile $cfExe -UseBasicParsing
+
+          Start-Job -Name "cloudflared" -ScriptBlock {
+            param($exe, $log)
+            & $exe tunnel --url http://localhost:6080 --loglevel info 2>&1 |
+              ForEach-Object { $_ | Out-File -FilePath $log -Append -Encoding utf8 }
+          } -ArgumentList $cfExe, $cfLog | Out-Null
+
+          # Poll the log until Cloudflare prints the public HTTPS URL (up to 60 s)
+          $browserUrl = $null
+          for ($i = 0; $i -lt 30; $i++) {
+            Start-Sleep -Seconds 2
+            if (Test-Path $cfLog) {
+              $content = Get-Content $cfLog -Raw -ErrorAction SilentlyContinue
+              if ($content -match '(https://[a-z0-9-]+\.trycloudflare\.com)') {
+                $browserUrl = $Matches[1]
+                break
+              }
+            }
+          }
+
+          if ($browserUrl) {
+            Write-Host ""
+            Write-Host "=========================================="
+            Write-Host "  Open in your browser:"
+            Write-Host "  $browserUrl/vnc.html"
+            Write-Host ""
+            Write-Host "  Password: (value of VNC_PASSWORD secret)"
+            Write-Host "=========================================="
+          } else {
+            Write-Error "Cloudflare tunnel URL not found within 60 seconds."
+            if (Test-Path $cfLog) { Get-Content $cfLog }
+            exit 1
+          }
+
+      - name: Keep runner alive for browser session
+        shell: powershell
+        run: |
           $minutes = [int]"$env:SESSION_MINUTES"
           if ($minutes -le 0 -or $minutes -gt 120) { $minutes = 60 }
           $seconds = $minutes * 60
           Write-Host "Runner will stay alive for $minutes minute(s)."
-          Write-Host "Cancel this workflow run when you are done with your RDP session."
+          Write-Host "Cancel this workflow run when you are done with your session."
           Start-Sleep -Seconds $seconds
         env:
-          SESSION_MINUTES: ${{ github.event.inputs.rdp_session_minutes || '60' }}
+          SESSION_MINUTES: ${{ github.event.inputs.session_minutes || '60' }}
