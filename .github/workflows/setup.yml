@@ -3,6 +3,11 @@ name: Setup VM with Chrome and Input Director
 on:
   push:
   workflow_dispatch:
+    inputs:
+      rdp_session_minutes:
+        description: "How long to keep the RDP session alive (in minutes, max 120)"
+        required: false
+        default: "60"
 
 jobs:
   setup:
@@ -65,3 +70,97 @@ jobs:
           } else {
             Write-Warning "Input Director executable not found at expected path. Installation may have used a different directory."
           }
+
+      # ── RDP access via ngrok ──────────────────────────────────────────────
+      # Requires two GitHub repository secrets:
+      #   RDP_PASSWORD     – the password you want to use when connecting via RDP
+      #   NGROK_AUTH_TOKEN – your ngrok auth token (sign up free at ngrok.com)
+      #
+      # How to connect once the workflow is running:
+      #   1. Open the workflow log and look for the "ngrok tunnel address" line.
+      #      It will look like:  tcp://X.tcp.ngrok.io:XXXXX
+      #   2. Open Remote Desktop Connection (mstsc) on your local machine.
+      #   3. In the "Computer" field enter:  X.tcp.ngrok.io:XXXXX
+      #   4. Username: runneradmin   Password: <value of RDP_PASSWORD secret>
+      # ─────────────────────────────────────────────────────────────────────
+
+      - name: Enable Remote Desktop (RDP)
+        shell: powershell
+        run: |
+          # Enable RDP in the registry
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
+            -Name fDenyTSConnections -Value 0
+
+          # Allow RDP through Windows Firewall
+          Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
+
+          # Set the RDP password for the built-in runner account
+          $password = ConvertTo-SecureString "$env:RDP_PASSWORD" -AsPlainText -Force
+          Set-LocalUser -Name "runneradmin" -Password $password
+
+          Write-Host "RDP enabled. Connect as user: runneradmin"
+        env:
+          RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
+
+      - name: Install and start ngrok tunnel
+        shell: powershell
+        run: |
+          # Download ngrok
+          $ngrokZip = "$env:TEMP\ngrok.zip"
+          Invoke-WebRequest -Uri "https://bin.equinox.io/c/bNyj1mQVY4c/ngrok-v3-stable-windows-amd64.zip" `
+            -OutFile $ngrokZip -UseBasicParsing
+          Expand-Archive -Path $ngrokZip -DestinationPath "$env:TEMP\ngrok" -Force
+          $ngrok = "$env:TEMP\ngrok\ngrok.exe"
+
+          # Authenticate with the ngrok auth token
+          & $ngrok config add-authtoken "$env:NGROK_AUTH_TOKEN"
+
+          # Start the TCP tunnel on RDP port 3389 in the background
+          $job = Start-Job -ScriptBlock {
+            param($ngrokPath)
+            & $ngrokPath tcp 3389
+          } -ArgumentList $ngrok
+
+          # Poll the ngrok local API until the tunnel is ready (up to 30 seconds)
+          $addr = $null
+          for ($i = 0; $i -lt 15; $i++) {
+            Start-Sleep -Seconds 2
+            try {
+              $tunnels = Invoke-RestMethod -Uri "http://127.0.0.1:4040/api/tunnels" -ErrorAction Stop
+              if ($tunnels.tunnels -and $tunnels.tunnels.Count -gt 0) {
+                $addr = $tunnels.tunnels[0].public_url
+                break
+              }
+            } catch {
+              # Tunnel not ready yet; keep waiting
+            }
+          }
+
+          if ($addr) {
+            Write-Host ""
+            Write-Host "=========================================="
+            Write-Host "  ngrok tunnel address: $addr"
+            Write-Host "  Username: runneradmin"
+            Write-Host "  Open Remote Desktop and connect to the"
+            Write-Host "  host/port shown above."
+            Write-Host "=========================================="
+          } else {
+            Write-Error "ngrok tunnel did not become ready within 30 seconds."
+            exit 1
+          }
+        env:
+          NGROK_AUTH_TOKEN: ${{ secrets.NGROK_AUTH_TOKEN }}
+
+      - name: Keep runner alive for RDP session
+        shell: powershell
+        run: |
+          # Session duration comes from the workflow_dispatch input (default 60 min).
+          # Falls back to 60 minutes when the workflow is triggered by a push event.
+          $minutes = [int]"$env:SESSION_MINUTES"
+          if ($minutes -le 0 -or $minutes -gt 120) { $minutes = 60 }
+          $seconds = $minutes * 60
+          Write-Host "Runner will stay alive for $minutes minute(s)."
+          Write-Host "Cancel this workflow run when you are done with your RDP session."
+          Start-Sleep -Seconds $seconds
+        env:
+          SESSION_MINUTES: ${{ github.event.inputs.rdp_session_minutes || '60' }}
