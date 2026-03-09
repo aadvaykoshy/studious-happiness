@@ -2,6 +2,7 @@ name: Setup VM with Chrome and Input Director
 
 on:
   push:
+    branches: [main]
   workflow_dispatch:
     inputs:
       session_minutes:
@@ -74,6 +75,10 @@ jobs:
           # HKLM\...\TightVNC\Server as "Password".
           # NOTE: VNC passwords are limited to 8 characters by the DES scheme;
           # only the first 8 characters of VNC_PASSWORD are used.
+          if ([string]::IsNullOrWhiteSpace($env:VNC_PASSWORD)) {
+            Write-Error "VNC_PASSWORD secret is not set. Add it in Settings > Secrets > Actions."
+            exit 1
+          }
           if ($env:VNC_PASSWORD.Length -gt 8) {
             Write-Warning "VNC_PASSWORD is longer than 8 characters; only the first 8 will be used."
           }
@@ -92,47 +97,8 @@ jobs:
           # BCrypt does not enforce the "known weak DES key" restriction that the
           # managed System.Security.Cryptography.DES class does, so any valid
           # 8-byte key – including keys that .NET would refuse – works here.
-          Add-Type -TypeDefinition @'
-using System;
-using System.Runtime.InteropServices;
-using System.Text;
-public static class VncPassHelper {
-    [DllImport("bcrypt.dll", CharSet=CharSet.Unicode)]
-    static extern int BCryptOpenAlgorithmProvider(out IntPtr h, string alg, string impl, uint flags);
-    [DllImport("bcrypt.dll", CharSet=CharSet.Unicode)]
-    static extern int BCryptSetProperty(IntPtr obj, string prop, byte[] val, int cbVal, uint flags);
-    [DllImport("bcrypt.dll")]
-    static extern int BCryptGenerateSymmetricKey(IntPtr hAlg, out IntPtr hKey, IntPtr keyObj, int cbKeyObj, byte[] secret, int cbSecret, uint flags);
-    [DllImport("bcrypt.dll")]
-    static extern int BCryptEncrypt(IntPtr hKey, byte[] input, int cbInput, IntPtr paddingInfo, byte[] iv, int cbIV, byte[] output, int cbOutput, out int cbResult, uint flags);
-    [DllImport("bcrypt.dll")]
-    static extern int BCryptDestroyKey(IntPtr hKey);
-    [DllImport("bcrypt.dll")]
-    static extern int BCryptCloseAlgorithmProvider(IntPtr h, uint flags);
-    static void Check(int status, string op) {
-        if (status != 0)
-            throw new Exception(string.Format("{0} failed with NTSTATUS 0x{1:X8}", op, (uint)status));
-    }
-    public static byte[] Hash(byte[] key) {
-        IntPtr hAlg = IntPtr.Zero, hKey = IntPtr.Zero;
-        try {
-            Check(BCryptOpenAlgorithmProvider(out hAlg, "DES", null, 0), "BCryptOpenAlgorithmProvider");
-            byte[] ecb = Encoding.Unicode.GetBytes("ECB\0");
-            Check(BCryptSetProperty(hAlg, "ChainingMode", ecb, ecb.Length, 0), "BCryptSetProperty");
-            Check(BCryptGenerateSymmetricKey(hAlg, out hKey, IntPtr.Zero, 0, key, key.Length, 0), "BCryptGenerateSymmetricKey");
-            byte[] plain = new byte[8];
-            byte[] cipher = new byte[8];
-            int cb;
-            Check(BCryptEncrypt(hKey, plain, 8, IntPtr.Zero, null, 0, cipher, 8, out cb, 0), "BCryptEncrypt");
-            return cipher;
-        } finally {
-            if (hKey != IntPtr.Zero) BCryptDestroyKey(hKey);
-            if (hAlg != IntPtr.Zero) BCryptCloseAlgorithmProvider(hAlg, 0);
-        }
-    }
-}
-'@
-          $hash = [VncPassHelper]::Hash($passBytes)
+          Add-Type -Path "$env:GITHUB_WORKSPACE\scripts\VncPassHelper.cs"
+          $hash = [VncHelper.VncPassHelper]::Hash($passBytes)
 
           # Try both 64-bit and 32-bit (WOW6432Node) registry paths
           foreach ($regPath in @("HKLM:\SOFTWARE\TightVNC\Server",
