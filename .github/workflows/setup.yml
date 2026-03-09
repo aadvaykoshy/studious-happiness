@@ -75,14 +75,26 @@ jobs:
           # HKLM\...\TightVNC\Server as "Password".
           # NOTE: VNC passwords are limited to 8 characters by the DES scheme;
           # only the first 8 characters of VNC_PASSWORD are used.
-          if ([string]::IsNullOrWhiteSpace($env:VNC_PASSWORD)) {
-            Write-Error "VNC_PASSWORD secret is not set. Add it in Settings > Secrets > Actions."
-            exit 1
+          $vncPassword = $env:VNC_PASSWORD
+          if ([string]::IsNullOrWhiteSpace($vncPassword)) {
+            # No secret configured - generate a random 8-character password and
+            # print it so the user can read it from the workflow log.
+            $chars = 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789'
+            $rng = [System.Security.Cryptography.RandomNumberGenerator]::Create()
+            $buf = New-Object byte[] 8
+            $rng.GetBytes($buf)
+            $vncPassword = -join ($buf | ForEach-Object { $chars[$_ % $chars.Length] })
+            Write-Host "No VNC_PASSWORD secret found - using auto-generated password."
+            Write-Host "=========================================="
+            Write-Host "  Auto-generated VNC password: $vncPassword"
+            Write-Host "  (Add a VNC_PASSWORD secret in Settings > Secrets > Actions"
+            Write-Host "   to set a fixed password for future runs.)"
+            Write-Host "=========================================="
           }
-          if ($env:VNC_PASSWORD.Length -gt 8) {
+          if ($vncPassword.Length -gt 8) {
             Write-Warning "VNC_PASSWORD is longer than 8 characters; only the first 8 will be used."
           }
-          $raw = $env:VNC_PASSWORD.Substring(0, [Math]::Min(8, $env:VNC_PASSWORD.Length)).PadRight(8, [char]0)
+          $raw = $vncPassword.Substring(0, [Math]::Min(8, $vncPassword.Length)).PadRight(8, [char]0)
           $passBytes = [System.Text.Encoding]::ASCII.GetBytes($raw)
           for ($i = 0; $i -lt 8; $i++) {
             $b = [byte]$passBytes[$i]
